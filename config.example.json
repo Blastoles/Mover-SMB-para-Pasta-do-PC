@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "id": "exemplo-impressora",
+      "name": "Impressora Exemplo",
+      "source": "\\\\IP_DA_IMPRESSORA\\pasta_compartilhada",
+      "destination": "C:\\caminho\\para\\pasta_de_destino",
+      "interval": 5,
+      "enabled": true,
+      "cleanup_days": 0
+    }
+  ],
+  "auto_start_monitor": true
+}
