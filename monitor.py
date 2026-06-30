@@ -66,9 +66,9 @@ class ScanMonitor:
             if s1 != s2:
                 return False
             
-            # Check 2: Try opening the file exclusively to ensure no other process (like scanner) is writing to it.
-            # On Windows, 'r+b' is excellent for checking exclusive locks.
-            with open(filepath, 'r+b') as f:
+            # Check 2: Try opening the file to ensure no other process (like scanner) is writing to it.
+            # On Windows, checking with 'rb' (read-only) will fail if another process has an exclusive lock.
+            with open(filepath, 'rb') as f:
                 pass
             return True
         except (OSError, PermissionError):
