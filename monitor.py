@@ -89,7 +89,8 @@ class ScanMonitor:
 
     def _process_rule(self, rule):
         """
-        Processes a single rule: scans source folder and moves files.
+        Processes a single rule recursively: scans source folder and subfolders,
+        recreates subfolder structure at destination, and moves files.
         """
         rule_name = rule.get("name", "Regra Sem Nome")
         source = rule.get("source")
@@ -104,6 +105,13 @@ class ScanMonitor:
             self.log(f"[{rule_name}] Origem inacessível ou inexistente: '{source}'", "WARN")
             return
 
+        norm_source = os.path.normpath(os.path.abspath(source)).lower()
+        norm_dest = os.path.normpath(os.path.abspath(destination)).lower()
+        
+        if norm_source == norm_dest:
+            self.log(f"[{rule_name}] Origem e destino são idênticos: '{source}'. Ignorado para evitar loops.", "ERROR")
+            return
+
         # Verify or create destination directory
         if not os.path.exists(destination):
             try:
@@ -113,56 +121,90 @@ class ScanMonitor:
                 self.log(f"[{rule_name}] Falha ao criar pasta de destino '{destination}': {e}", "ERROR")
                 return
 
-        # List files in source directory
+        # Loop prevention: define prefix to identify if walking inside destination
+        norm_dest_prefix = norm_dest + os.sep
+
+        # Walk the source directory recursively
         try:
-            items = os.listdir(source)
+            for root, dirs, files in os.walk(source):
+                if self.stop_event.is_set():
+                    break
+
+                norm_root = os.path.normpath(os.path.abspath(root)).lower()
+                
+                # Check if current directory is destination or inside destination
+                if norm_root == norm_dest or norm_root.startswith(norm_dest_prefix):
+                    continue
+
+                # Filter out subdirectories that match or are inside the destination folder to prevent recursion loop
+                dirs[:] = [
+                    d for d in dirs 
+                    if os.path.normpath(os.path.abspath(os.path.join(root, d))).lower() != norm_dest and 
+                    not os.path.normpath(os.path.abspath(os.path.join(root, d))).lower().startswith(norm_dest_prefix)
+                ]
+
+                # Determine destination folder mapping for this subfolder
+                rel_path = os.path.relpath(root, source)
+                if rel_path == ".":
+                    target_dest_dir = destination
+                else:
+                    target_dest_dir = os.path.join(destination, rel_path)
+
+                for file in files:
+                    if self.stop_event.is_set():
+                        break
+
+                    # Skip temporary files
+                    if file.lower() in ['thumbs.db', 'desktop.ini']:
+                        continue
+
+                    src_path = os.path.join(root, file)
+
+                    # Ensure it is a file before processing
+                    if not os.path.isfile(src_path):
+                        continue
+
+                    self.log(f"[{rule_name}] Detectado novo arquivo: '{os.path.join(rel_path, file) if rel_path != '.' else file}'. Aguardando estabilização...", "INFO")
+
+                    # Wait until the file is ready to be moved
+                    if self._is_file_ready(src_path):
+                        # Ensure target destination subdirectory exists
+                        if not os.path.exists(target_dest_dir):
+                            try:
+                                os.makedirs(target_dest_dir, exist_ok=True)
+                                self.log(f"[{rule_name}] Subpasta de destino criada: '{target_dest_dir}'", "INFO")
+                            except Exception as e:
+                                self.log(f"[{rule_name}] Falha ao criar subpasta de destino '{target_dest_dir}': {e}", "ERROR")
+                                continue
+
+                        dest_path = self._get_unique_destination_path(target_dest_dir, file)
+                        dest_filename = os.path.basename(dest_path)
+
+                        try:
+                            # Move the file safely
+                            shutil.move(src_path, dest_path)
+
+                            rel_dest_log = os.path.join(rel_path, dest_filename) if rel_path != '.' else dest_filename
+                            if dest_filename != file:
+                                self.log(f"[{rule_name}] Movido com sucesso: '{file}' -> '{rel_dest_log}' (conflito de nome resolvido)", "INFO")
+                            else:
+                                self.log(f"[{rule_name}] Movido com sucesso: '{file}' -> '{target_dest_dir}'", "INFO")
+                        except Exception as e:
+                            self.log(f"[{rule_name}] Erro ao mover arquivo '{file}': {e}", "ERROR")
+                    else:
+                        self.log(f"[{rule_name}] Arquivo '{file}' ainda em escrita ou bloqueado. Ignorado nesta rodada.", "WARN")
+
         except Exception as e:
-            self.log(f"[{rule_name}] Falha ao listar arquivos na origem: {e}", "ERROR")
+            self.log(f"[{rule_name}] Falha ao percorrer arquivos na origem: {e}", "ERROR")
             return
 
-        for item in items:
-            # Check if stop requested mid-process
-            if self.stop_event.is_set():
-                break
-
-            src_path = os.path.join(source, item)
-            
-            # Skip directories, process only files
-            if not os.path.isfile(src_path):
-                continue
-                
-            # Skip temporary scan files if any exist (e.g. system files like thumbs.db or temporary printer locks)
-            if item.lower() in ['thumbs.db', 'desktop.ini']:
-                continue
-
-            self.log(f"[{rule_name}] Detectado novo arquivo: '{item}'. Aguardando estabilização...", "INFO")
-            
-            # Wait until the file is ready to be moved
-            if self._is_file_ready(src_path):
-                dest_path = self._get_unique_destination_path(destination, item)
-                dest_filename = os.path.basename(dest_path)
-                
-                try:
-                    # Move the file safely
-                    # shutil.move handles cross-volume movement by copying and deleting,
-                    # which is perfect if source is network share and dest is local C: drive
-                    shutil.move(src_path, dest_path)
-                    
-                    if dest_filename != item:
-                        self.log(f"[{rule_name}] Movido com sucesso: '{item}' -> '{dest_filename}' (conflito de nome resolvido)", "INFO")
-                    else:
-                        self.log(f"[{rule_name}] Movido com sucesso: '{item}' -> '{destination}'", "INFO")
-                except Exception as e:
-                    self.log(f"[{rule_name}] Erro ao mover arquivo '{item}': {e}", "ERROR")
-            else:
-                self.log(f"[{rule_name}] Arquivo '{item}' ainda em escrita ou bloqueado. Ignorado nesta rodada.", "WARN")
-        
         # Run auto-cleanup for this rule if configured
         self._run_cleanup(rule)
 
     def _run_cleanup(self, rule):
         """
-        Deletes files in the destination directory that are older than rule['cleanup_days'] days.
+        Deletes files in the destination directory (recursively) that are older than rule['cleanup_days'] days,
+        and removes empty destination subfolders.
         """
         cleanup_days = rule.get("cleanup_days", 0)
         if not cleanup_days or int(cleanup_days) <= 0:
@@ -178,31 +220,43 @@ class ScanMonitor:
             now = time.time()
             threshold_seconds = int(cleanup_days) * 86400
             
-            items = os.listdir(destination)
-            for item in items:
+            # Walk from bottom up to safely delete empty child directories after files are removed
+            for root, dirs, files in os.walk(destination, topdown=False):
                 if self.stop_event.is_set():
                     break
                     
-                filepath = os.path.join(destination, item)
-                if not os.path.isfile(filepath):
-                    continue
-                    
-                if item.lower() in ['thumbs.db', 'desktop.ini']:
-                    continue
-                    
-                mtime = os.path.getmtime(filepath)
-                age_seconds = now - mtime
-                
-                if age_seconds > threshold_seconds:
-                    try:
-                        # Ensure it's not locked by trying to open it read-write exclusively
-                        with open(filepath, 'r+b') as f:
-                            pass
+                for file in files:
+                    if self.stop_event.is_set():
+                        break
                         
-                        os.remove(filepath)
-                        self.log(f"[{rule_name}] Autolimpeza: Arquivo '{item}' removido (mais antigo que {cleanup_days} dias).", "INFO")
+                    if file.lower() in ['thumbs.db', 'desktop.ini']:
+                        continue
+                        
+                    filepath = os.path.join(root, file)
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        age_seconds = now - mtime
+                        
+                        if age_seconds > threshold_seconds:
+                            # Ensure it's not locked
+                            with open(filepath, 'r+b') as f:
+                                pass
+                            os.remove(filepath)
+                            
+                            rel_file_path = os.path.join(os.path.relpath(root, destination), file) if root != destination else file
+                            self.log(f"[{rule_name}] Autolimpeza: Arquivo '{rel_file_path}' removido (mais antigo que {cleanup_days} dias).", "INFO")
                     except (OSError, PermissionError) as e:
-                        self.log(f"[{rule_name}] Autolimpeza: Não foi possível excluir '{item}' pois está em uso: {e}", "WARN")
+                        self.log(f"[{rule_name}] Autolimpeza: Não foi possível excluir '{file}': {e}", "WARN")
+                
+                # Check and remove empty subfolders (do not remove root destination)
+                if root != destination:
+                    try:
+                        if not os.listdir(root):
+                            os.rmdir(root)
+                            self.log(f"[{rule_name}] Autolimpeza: Pasta vazia '{os.path.relpath(root, destination)}' removida.", "INFO")
+                    except Exception:
+                        pass
+
         except Exception as e:
             self.log(f"[{rule_name}] Erro na autolimpeza: {e}", "ERROR")
 

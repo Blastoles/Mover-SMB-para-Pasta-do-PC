@@ -32,6 +32,19 @@ class PrinterScanMoverApp:
         self.root.geometry("900x650")
         self.root.minsize(800, 550)
         
+        # Set window icon if exists
+        icon_name = "printer.ico"
+        if getattr(sys, 'frozen', False):
+            self.icon_path = os.path.join(os.path.dirname(sys.executable), icon_name)
+        else:
+            self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), icon_name)
+            
+        if os.path.exists(self.icon_path):
+            try:
+                self.root.iconbitmap(self.icon_path)
+            except Exception:
+                pass
+        
         # UI Colors (Modern Dark Theme)
         self.bg_color = "#1e1e1e"
         self.card_color = "#2d2d2d"
@@ -711,12 +724,21 @@ class PrinterScanMoverApp:
         
         # Setup system tray icon if not created yet
         if not self.tray_icon:
-            # Create a basic tray icon image (a dynamic blue scanner box)
-            image = Image.new('RGB', (64, 64), color=(30, 30, 30))
-            d = ImageDraw.Draw(image)
-            # Draw a simulated scanner icon inside
-            d.rectangle([16, 24, 48, 40], fill=(26, 115, 232), outline=(255, 255, 255))
-            d.line([16, 32, 48, 32], fill=(255, 255, 255), width=2)
+            # Try to load downloaded printer icon
+            image = None
+            if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
+                try:
+                    image = Image.open(self.icon_path)
+                except Exception:
+                    pass
+            
+            # Fallback to drawn icon if loading fails
+            if not image:
+                image = Image.new('RGB', (64, 64), color=(30, 30, 30))
+                d = ImageDraw.Draw(image)
+                # Draw a simulated scanner icon inside
+                d.rectangle([16, 24, 48, 40], fill=(26, 115, 232), outline=(255, 255, 255))
+                d.line([16, 32, 48, 32], fill=(255, 255, 255), width=2)
             
             menu = pystray.Menu(
                 pystray.MenuItem("Abrir Painel", self.restore_from_tray, default=True),
