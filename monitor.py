@@ -1,9 +1,34 @@
 import os
 import time
 import shutil
+import socket
 import logging
 import threading
+import concurrent.futures
 from datetime import datetime
+
+def _is_unc_path(path):
+    return path.startswith(r"\\") or path.startswith("//")
+
+def _get_unc_host(path):
+    cleaned = path.replace("/", "\\").lstrip("\\")
+    parts = cleaned.split("\\")
+    return parts[0] if parts else None
+
+def _is_host_online(host, timeout=0.6):
+    """
+    Rapidly tests SMB ports 445 and 139 via TCP socket.
+    Avoids 40-second kernel freezes on offline printers.
+    """
+    for port in (445, 139):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                if s.connect_ex((host, port)) == 0:
+                    return True
+        except Exception:
+            pass
+    return False
 
 class ScanMonitor:
     def __init__(self, config_loader_callback, log_callback=None):
@@ -16,7 +41,11 @@ class ScanMonitor:
         self.log_callback = log_callback
         self.stop_event = threading.Event()
         self.thread = None
-        self.active_rules_threads = {}
+        self.running = False
+        self.active_rule_tasks = set()
+        self.active_tasks_lock = threading.Lock()
+        self.verified_sources = set()
+        self.logged_offline = set()
 
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -28,28 +57,35 @@ class ScanMonitor:
 
     def start(self):
         """Starts the monitoring thread loop."""
-        if self.thread and self.thread.is_alive():
+        if self.running:
             self.log("O monitor já está em execução.", "WARN")
             return
         
         self.stop_event.clear()
+        self.running = True
         self.thread = threading.Thread(target=self._run_loop, name="ScanMonitorLoop", daemon=True)
         self.thread.start()
         self.log("Serviço de monitoramento iniciado.", "INFO")
 
     def stop(self):
         """Stops the monitoring thread loop."""
-        if not self.thread or not self.thread.is_alive():
+        if not self.running:
             self.log("O monitor não está em execução.", "WARN")
             return
         
         self.log("Parando serviço de monitoramento...", "INFO")
+        self.running = False
         self.stop_event.set()
-        self.thread.join(timeout=3)
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        self.verified_sources.clear()
+        self.logged_offline.clear()
+        with self.active_tasks_lock:
+            self.active_rule_tasks.clear()
         self.log("Serviço de monitoramento parado.", "INFO")
 
     def is_running(self):
-        return self.thread is not None and self.thread.is_alive()
+        return self.running
 
     def _is_file_ready(self, filepath):
         """
@@ -66,13 +102,11 @@ class ScanMonitor:
             if s1 != s2:
                 return False
             
-            # Check 2: Try opening the file to ensure no other process (like scanner) is writing to it.
-            # On Windows, checking with 'rb' (read-only) will fail if another process has an exclusive lock.
+            # Check 2: Try opening the file to ensure no process has an exclusive write lock.
             with open(filepath, 'rb') as f:
                 pass
             return True
         except (OSError, PermissionError):
-            # File is locked or inaccessible
             return False
 
     def _get_unique_destination_path(self, dest_dir, filename):
@@ -93,16 +127,39 @@ class ScanMonitor:
         recreates subfolder structure at destination, and moves files.
         """
         rule_name = rule.get("name", "Regra Sem Nome")
-        source = rule.get("source")
-        destination = rule.get("destination")
+        source = (rule.get("source") or "").strip()
+        destination = (rule.get("destination") or "").strip()
         
         if not source or not destination:
             self.log(f"[{rule_name}] Caminho de origem ou destino não configurado.", "ERROR")
             return
 
+        # Fix Python 3.15 bug: os.walk fails to add trailing slash to UNC roots (\\host\share)
+        if _is_unc_path(source) and not source.endswith(os.sep) and not source.endswith('/'):
+            source = source + os.sep
+
+        # Fast pre-check for network UNC paths to avoid 40-second Windows kernel freeze
+        if _is_unc_path(source):
+            host = _get_unc_host(source)
+            if host and not _is_host_online(host, timeout=0.6):
+                self.verified_sources.discard(source)
+                if source not in self.logged_offline:
+                    self.logged_offline.add(source)
+                    self.log(f"[{rule_name}] Impressora offline ({host} não responde na rede). Aguardando conexão...", "WARN")
+                return
+            elif source in self.logged_offline:
+                self.logged_offline.discard(source)
+                self.log(f"[{rule_name}] Impressora voltou a ficar online: '{source}'", "INFO")
+
         # Check if source directory exists
-        if not os.path.exists(source):
-            self.log(f"[{rule_name}] Origem inacessível ou inexistente: '{source}'", "WARN")
+        try:
+            if not os.path.exists(source):
+                self.verified_sources.discard(source)
+                self.log(f"[{rule_name}] Origem inacessível ou inexistente: '{source}'", "WARN")
+                return
+        except Exception as e:
+            self.verified_sources.discard(source)
+            self.log(f"[{rule_name}] Erro ao checar origem '{source}': {e}", "ERROR")
             return
 
         norm_source = os.path.normpath(os.path.abspath(source)).lower()
@@ -121,12 +178,21 @@ class ScanMonitor:
                 self.log(f"[{rule_name}] Falha ao criar pasta de destino '{destination}': {e}", "ERROR")
                 return
 
+        # Log confirmation when origin becomes active
+        if source not in self.verified_sources:
+            self.verified_sources.add(source)
+            self.log(f"[{rule_name}] Origem acessível: '{source}'. Monitorando...", "INFO")
+
         # Loop prevention: define prefix to identify if walking inside destination
         norm_dest_prefix = norm_dest + os.sep
 
+        def on_walk_error(err):
+            target = getattr(err, 'filename', source)
+            self.log(f"[{rule_name}] Falha de permissão/acesso ao varrer '{target}': {err}", "ERROR")
+
         # Walk the source directory recursively
         try:
-            for root, dirs, files in os.walk(source):
+            for root, dirs, files in os.walk(source, onerror=on_walk_error):
                 if self.stop_event.is_set():
                     break
 
@@ -160,8 +226,8 @@ class ScanMonitor:
 
                     src_path = os.path.join(root, file)
 
-                    # Ensure it is a file before processing
-                    if not os.path.isfile(src_path):
+                    # Ensure it is not a directory (handles Linux/Samba 0x0 attributes where isfile returns False)
+                    if os.path.isdir(src_path):
                         continue
 
                     self.log(f"[{rule_name}] Detectado novo arquivo: '{os.path.join(rel_path, file) if rel_path != '.' else file}'. Aguardando estabilização...", "INFO")
@@ -190,7 +256,7 @@ class ScanMonitor:
                             else:
                                 self.log(f"[{rule_name}] Movido com sucesso: '{file}' -> '{target_dest_dir}'", "INFO")
                         except Exception as e:
-                            self.log(f"[{rule_name}] Erro ao mover arquivo '{file}': {e}", "ERROR")
+                            self.log(f"[{rule_name}] Erro ao mover arquivo '{file}': {e} (feche o arquivo se estiver aberto no navegador ou editor)", "ERROR")
                     else:
                         self.log(f"[{rule_name}] Arquivo '{file}' ainda em escrita ou bloqueado. Ignorado nesta rodada.", "WARN")
 
@@ -238,7 +304,6 @@ class ScanMonitor:
                         age_seconds = now - mtime
                         
                         if age_seconds > threshold_seconds:
-                            # Ensure it's not locked
                             with open(filepath, 'r+b') as f:
                                 pass
                             os.remove(filepath)
@@ -260,46 +325,52 @@ class ScanMonitor:
         except Exception as e:
             self.log(f"[{rule_name}] Erro na autolimpeza: {e}", "ERROR")
 
+    def _safe_process_rule(self, rule, rule_id):
+        try:
+            if not self.stop_event.is_set():
+                self._process_rule(rule)
+        except Exception as e:
+            self.log(f"Erro inesperado processando regra '{rule.get('name')}': {e}", "ERROR")
+        finally:
+            with self.active_tasks_lock:
+                self.active_rule_tasks.discard(rule_id)
+
     def _run_loop(self):
         """
-        Background monitoring loop.
+        Background monitoring loop executing rules concurrently via ThreadPoolExecutor.
         """
-        # Tracks the last time each rule was run to respect its individual check interval
         last_run = {}
 
-        while not self.stop_event.is_set():
-            try:
-                # Load configurations dynamically
-                rules = self.config_loader_callback()
-            except Exception as e:
-                self.log(f"Erro ao carregar configurações: {e}", "ERROR")
-                time.sleep(5)
-                continue
-
-            current_time = time.time()
-
-            for rule in rules:
-                if self.stop_event.is_set():
-                    break
-
-                if not rule.get("enabled", False):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            while not self.stop_event.is_set():
+                try:
+                    rules = self.config_loader_callback()
+                except Exception as e:
+                    self.log(f"Erro ao carregar configurações: {e}", "ERROR")
+                    time.sleep(5)
                     continue
 
-                rule_id = rule.get("id")
-                interval = max(1, int(rule.get("interval", 5))) # minimum 1 second
+                current_time = time.time()
 
-                # If it's time to run this rule
-                if rule_id not in last_run or (current_time - last_run[rule_id]) >= interval:
-                    # Process the rule
-                    try:
-                        self._process_rule(rule)
-                    except Exception as e:
-                        self.log(f"Erro inesperado processando regra '{rule.get('name')}': {e}", "ERROR")
-                    
-                    last_run[rule_id] = time.time()
+                for rule in rules:
+                    if self.stop_event.is_set():
+                        break
 
-            # Sleep in short increments to remain responsive to stop_event
-            for _ in range(10):
-                if self.stop_event.is_set():
-                    break
-                time.sleep(0.1)
+                    if not rule.get("enabled", False):
+                        continue
+
+                    rule_id = rule.get("id")
+                    interval = max(1, int(rule.get("interval", 5)))
+
+                    if rule_id not in last_run or (current_time - last_run[rule_id]) >= interval:
+                        last_run[rule_id] = current_time
+                        with self.active_tasks_lock:
+                            if rule_id not in self.active_rule_tasks:
+                                self.active_rule_tasks.add(rule_id)
+                                executor.submit(self._safe_process_rule, rule, rule_id)
+
+                # Sleep in short increments to remain responsive to stop_event
+                for _ in range(10):
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(0.1)

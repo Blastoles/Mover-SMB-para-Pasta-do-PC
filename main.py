@@ -3,18 +3,25 @@ import sys
 import json
 import uuid
 import queue
+import time
+import ctypes
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import winreg
+from datetime import datetime
 
-# Import the monitor module we created
+# Import the monitor module
 from monitor import ScanMonitor
 
 if getattr(sys, 'frozen', False):
-    CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), "config.json")
+    APP_DIR = os.path.dirname(sys.executable)
 else:
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+LOG_FILE = os.path.join(APP_DIR, "printer_scan_mover.log")
 
 # Try to import system tray libraries
 TRAY_AVAILABLE = False
@@ -25,20 +32,80 @@ try:
 except ImportError:
     pass
 
+
+def is_service_running():
+    """Checks if the headless background service is running via Global Mutex."""
+    kernel32 = ctypes.windll.kernel32
+    SYNCHRONIZE = 0x00100000
+    m = kernel32.OpenMutexW(SYNCHRONIZE, False, "Global\\PrinterScanMover_Service")
+    if m:
+        kernel32.CloseHandle(m)
+        return True
+    return False
+
+
+def focus_existing_gui():
+    """If another GUI window is already open in this desktop session, brings it to front and returns True."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, "Monitor de Escaneamento Multimpressoras")
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)  # 9 = SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    return False
+
+
+def run_headless_service():
+    """Runs pure background worker without GUI for Windows Task Scheduler / boot."""
+    kernel32 = ctypes.windll.kernel32
+    mutex = kernel32.CreateMutexW(None, False, "Global\\PrinterScanMover_Service")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("Serviço PrinterScanMover já está em execução.")
+        sys.exit(0)
+
+    def get_service_rules():
+        if not os.path.exists(CONFIG_FILE):
+            return []
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("rules", [])
+        except Exception:
+            return []
+
+    def log_to_file(msg):
+        print(msg)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    log_to_file(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Serviço de segundo plano iniciado no boot do Windows.")
+
+    monitor = ScanMonitor(config_loader_callback=get_service_rules, log_callback=log_to_file)
+    monitor.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        monitor.stop()
+        if mutex:
+            kernel32.CloseHandle(mutex)
+
+
 class PrinterScanMoverApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Monitor de Escaneamento Multimpressoras")
-        self.root.geometry("900x650")
-        self.root.minsize(800, 550)
+        self.root.geometry("950x660")
+        self.root.minsize(850, 560)
         
         # Set window icon if exists
         icon_name = "printer.ico"
-        if getattr(sys, 'frozen', False):
-            self.icon_path = os.path.join(os.path.dirname(sys.executable), icon_name)
-        else:
-            self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), icon_name)
-            
+        self.icon_path = os.path.join(APP_DIR, icon_name)
         if os.path.exists(self.icon_path):
             try:
                 self.root.iconbitmap(self.icon_path)
@@ -61,6 +128,10 @@ class PrinterScanMoverApp:
         
         # Thread safety queue for log handling
         self.log_queue = queue.Queue()
+        self.log_file_offset = 0
+        
+        # Check if Background Service is already running on the server
+        self.service_mode = is_service_running()
         
         # Load initial configuration
         self.config = self.load_config()
@@ -71,7 +142,7 @@ class PrinterScanMoverApp:
         # Setup widgets
         self.build_ui()
         
-        # Initialize Monitor Engine
+        # Initialize Monitor Engine (for standalone mode)
         self.monitor = ScanMonitor(
             config_loader_callback=self.get_active_rules,
             log_callback=self.log_callback
@@ -80,12 +151,25 @@ class PrinterScanMoverApp:
         # Start queue reader
         self.process_queue_loop()
         
-        # Auto-start monitor if there are active rules
-        self.check_auto_start()
+        if self.service_mode:
+            self.status_indicator.configure(
+                text="EXECUTANDO (SERVIÇO)",
+                bg="#1b5e20",
+                fg=self.success_color
+            )
+            self.btn_toggle_monitor.configure(
+                text="Parar Serviço",
+                bg=self.warning_color,
+                fg="black"
+            )
+            self.load_recent_service_logs()
+            self.tail_service_log()
+        else:
+            # Auto-start monitor if configured and rules active
+            self.check_auto_start()
 
         # Handle window closing to minimize to tray or ask
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
-        
         self.tray_icon = None
 
     def setup_styles(self):
@@ -154,6 +238,39 @@ class PrinterScanMoverApp:
     def log_callback(self, formatted_message):
         """Callback used by monitor engine to output logs."""
         self.log_queue.put(formatted_message)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(formatted_message + "\n")
+        except Exception:
+            pass
+
+    def load_recent_service_logs(self):
+        """Loads the most recent log lines from service.log when opening the UI."""
+        if os.path.exists(LOG_FILE):
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                    for line in lines[-60:]:
+                        self.insert_log_to_ui(line.rstrip("\r\n"))
+                    self.log_file_offset = f.tell()
+            except Exception:
+                pass
+
+    def tail_service_log(self):
+        """Periodically reads new entries from service.log so the user sees live activity."""
+        if self.service_mode and os.path.exists(LOG_FILE):
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(self.log_file_offset)
+                    new_lines = f.readlines()
+                    self.log_file_offset = f.tell()
+                    for line in new_lines:
+                        line_str = line.rstrip("\r\n")
+                        if line_str:
+                            self.insert_log_to_ui(line_str)
+            except Exception:
+                pass
+        self.root.after(1000, self.tail_service_log)
 
     def process_queue_loop(self):
         """Reads log messages from queue and displays in UI."""
@@ -168,7 +285,6 @@ class PrinterScanMoverApp:
     def insert_log_to_ui(self, msg):
         self.log_text.configure(state="normal")
         
-        # Determine log level to apply custom tags/colors
         tag = "INFO"
         if "[WARN]" in msg:
             tag = "WARN"
@@ -177,7 +293,7 @@ class PrinterScanMoverApp:
         
         self.log_text.insert(tk.END, msg + "\n", tag)
         
-        # Keep logs under 1000 lines to avoid memory buildup
+        # Keep logs under 1000 lines
         total_lines = int(self.log_text.index('end-1c').split('.')[0])
         if total_lines > 1000:
             self.log_text.delete("1.0", "200.0")
@@ -212,7 +328,7 @@ class PrinterScanMoverApp:
         )
         self.status_indicator.pack(side=tk.RIGHT, padx=15, pady=15)
 
-        # Main Layout split: Config (top half) and Log (bottom half)
+        # Main Layout
         main_content = tk.Frame(self.root, bg=self.bg_color)
         main_content.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
 
@@ -236,7 +352,6 @@ class PrinterScanMoverApp:
         btn_panel = tk.Frame(table_container, bg=self.bg_color)
         btn_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
 
-        # Modern flat buttons
         self.btn_add = tk.Button(
             btn_panel, text="Adicionar Regra", bg=self.accent_color, fg="white", 
             relief="flat", bd=0, activebackground=self.accent_hover, activeforeground="white",
@@ -290,7 +405,7 @@ class PrinterScanMoverApp:
         self.tree.heading("status", text="Ativo?")
 
         self.tree.column("id", width=0, stretch=tk.NO)
-        self.tree.column("name", width=160, anchor=tk.W)
+        self.tree.column("name", width=150, anchor=tk.W)
         self.tree.column("source", width=220, anchor=tk.W)
         self.tree.column("destination", width=180, anchor=tk.W)
         self.tree.column("interval", width=70, anchor=tk.CENTER)
@@ -300,7 +415,7 @@ class PrinterScanMoverApp:
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.populate_table()
 
-        # Logs panel (bottom half)
+        # Logs panel
         log_frame = tk.LabelFrame(
             main_content, 
             text=" Registro de Atividades (Logs em tempo real) ", 
@@ -323,18 +438,28 @@ class PrinterScanMoverApp:
         )
         btn_clear_log.pack(side=tk.RIGHT)
         
-        # Checkbox options
+        # Checkbox 1: Task Scheduler boot service (NO LOGIN REQUIRED)
+        self.boot_service_var = tk.BooleanVar(value=self.check_task_scheduler())
+        chk_service = tk.Checkbutton(
+            log_toolbar, text="Subir no Boot (Sem Login / Agendador)", variable=self.boot_service_var,
+            bg=self.bg_color, fg=self.success_color, selectcolor=self.bg_color, activebackground=self.bg_color,
+            activeforeground=self.success_color, font=("Segoe UI", 9, "bold"), command=self.toggle_boot_service
+        )
+        chk_service.pack(side=tk.LEFT, padx=(0, 15))
+
+        # Checkbox 2: Start with Windows Registry (with user login)
         self.start_with_windows_var = tk.BooleanVar(value=self.check_startup_registry())
         chk_startup = tk.Checkbutton(
-            log_toolbar, text="Iniciar com o Windows", variable=self.start_with_windows_var,
+            log_toolbar, text="Iniciar ao Logar no Windows", variable=self.start_with_windows_var,
             bg=self.bg_color, fg=self.text_color, selectcolor=self.bg_color, activebackground=self.bg_color,
             activeforeground=self.text_color, font=("Segoe UI", 9), command=self.toggle_startup
         )
         chk_startup.pack(side=tk.LEFT, padx=(0, 15))
 
+        # Checkbox 3: Auto-start monitor on app open
         self.auto_start_var = tk.BooleanVar(value=self.config.get("auto_start_monitor", True))
         chk_autostart = tk.Checkbutton(
-            log_toolbar, text="Auto-iniciar monitoramento ao abrir app", variable=self.auto_start_var,
+            log_toolbar, text="Auto-iniciar ao abrir", variable=self.auto_start_var,
             bg=self.bg_color, fg=self.text_color, selectcolor=self.bg_color, activebackground=self.bg_color,
             activeforeground=self.text_color, font=("Segoe UI", 9), command=self.toggle_auto_start_setting
         )
@@ -364,22 +489,11 @@ class PrinterScanMoverApp:
         self.log_text.tag_config("INFO", foreground="#2ecc71")
         self.log_text.tag_config("WARN", foreground="#f39c12")
         self.log_text.tag_config("ERROR", foreground="#e74c3c")
-        
-        # Tray notice if pystray/pillow is missing
-        if not TRAY_AVAILABLE:
-            tray_notice = tk.Label(
-                self.root, 
-                text="Aviso: Instale 'pillow' e 'pystray' no Python (pip install pillow pystray) para habilitar minimizar para a bandeja.",
-                bg=self.bg_color, fg=self.text_muted, font=("Segoe UI", 8, "italic")
-            )
-            tray_notice.pack(side=tk.BOTTOM, fill=tk.X, pady=2)
 
     def populate_table(self):
-        # Clear existing items
         for child in self.tree.get_children():
             self.tree.delete(child)
             
-        # Add rules from config
         for rule in self.config.get("rules", []):
             status = "Sim" if rule.get("enabled", False) else "Não"
             cleanup_days = rule.get("cleanup_days", 0)
@@ -409,18 +523,30 @@ class PrinterScanMoverApp:
 
     def check_auto_start(self):
         if self.config.get("auto_start_monitor", True) and len(self.config.get("rules", [])) > 0:
-            # Check if at least one rule is enabled
             if any(rule.get("enabled", False) for rule in self.config.get("rules", [])):
                 self.root.after(500, self.start_monitoring)
 
     def toggle_monitor(self):
-        if self.monitor.is_running():
-            self.stop_monitoring()
+        if self.service_mode:
+            confirm = messagebox.askyesno(
+                "Parar Serviço", 
+                "O serviço de monitoramento está rodando em segundo plano no Windows.\nDeseja finalizá-lo agora?"
+            )
+            if confirm:
+                subprocess.run(["schtasks", "/End", "/TN", "PrinterScanMover"], capture_output=True)
+                time.sleep(1)
+                self.service_mode = is_service_running()
+                if not self.service_mode:
+                    self.status_indicator.configure(text="INATIVO", bg="#3e2723", fg=self.warning_color)
+                    self.btn_toggle_monitor.configure(text="Iniciar Monitor", bg=self.success_color, fg="black")
+                    self.log_callback("[INFO] Serviço em segundo plano finalizado.")
         else:
-            self.start_monitoring()
+            if self.monitor.is_running():
+                self.stop_monitoring()
+            else:
+                self.start_monitoring()
 
     def start_monitoring(self):
-        # Check if there are active rules first
         active = [r for r in self.config.get("rules", []) if r.get("enabled", False)]
         if not active:
             messagebox.showwarning("Aviso", "Nenhuma regra ativa para monitorar. Ative ou crie uma regra primeiro.")
@@ -451,7 +577,72 @@ class PrinterScanMoverApp:
             fg="black"
         )
 
-    # Startup control via Windows Registry
+    # Task Scheduler configuration (Runs on boot with NO USER LOGIN required)
+    def check_task_scheduler(self):
+        try:
+            res = subprocess.run(
+                ["schtasks", "/Query", "/TN", "PrinterScanMover"],
+                capture_output=True,
+                encoding="cp850",
+                errors="replace"
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def toggle_boot_service(self):
+        enabled = self.boot_service_var.get()
+        task_name = "PrinterScanMover"
+        
+        if getattr(sys, 'frozen', False):
+            exe_cmd = f'"{sys.executable}" --service'
+        else:
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if not os.path.exists(pythonw):
+                pythonw = sys.executable
+            script_path = os.path.abspath(sys.argv[0])
+            exe_cmd = f'"{pythonw}" "{script_path}" --service'
+
+        if enabled:
+            try:
+                res = subprocess.run(
+                    ["schtasks", "/Create", "/TN", task_name, "/TR", exe_cmd, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F"],
+                    capture_output=True,
+                    encoding="cp850",
+                    errors="replace"
+                )
+                if res.returncode == 0:
+                    self.log_callback("[INFO] Inicialização no Boot (sem login) ativada com sucesso no Agendador de Tarefas.")
+                    messagebox.showinfo(
+                        "Sucesso", 
+                        "O monitor agora iniciará automaticamente com o boot do servidor, mesmo sem nenhum usuário conectado."
+                    )
+                else:
+                    err_msg = res.stderr.strip() or res.stdout.strip()
+                    messagebox.showerror(
+                        "Permissão Necessária", 
+                        f"Falha ao criar tarefa no agendador do Windows (requer permissão de Administrador):\n{err_msg}"
+                    )
+                    self.boot_service_var.set(False)
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao executar schtasks: {e}")
+                self.boot_service_var.set(False)
+        else:
+            try:
+                res = subprocess.run(
+                    ["schtasks", "/Delete", "/TN", task_name, "/F"],
+                    capture_output=True,
+                    encoding="cp850",
+                    errors="replace"
+                )
+                if res.returncode == 0:
+                    self.log_callback("[INFO] Inicialização no Boot desativada no Agendador de Tarefas.")
+                else:
+                    self.log_callback(f"[WARN] Erro ao desativar tarefa no Agendador: {res.stderr.strip()}")
+            except Exception as e:
+                self.log_callback(f"[ERROR] Erro ao remover tarefa: {e}")
+
+    # Startup control via Windows Registry (with user logon)
     def check_startup_registry(self):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "PrinterScanMover"
@@ -470,12 +661,9 @@ class PrinterScanMoverApp:
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "PrinterScanMover"
         
-        # Decide launch command
-        # If run inside python executable, use sys.executable
         if getattr(sys, 'frozen', False):
             cmd = f'"{sys.executable}" --minimized'
         else:
-            # If standard script, run with pythonw.exe (no console window)
             pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
             if not os.path.exists(pythonw):
                 pythonw = "pythonw.exe"
@@ -486,17 +674,17 @@ class PrinterScanMoverApp:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
             if enabled:
                 winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
-                self.log_callback("[INFO] Inicialização com o Windows ativada com sucesso.")
+                self.log_callback("[INFO] Inicialização ao logar ativada com sucesso.")
             else:
                 try:
                     winreg.DeleteValue(key, app_name)
-                    self.log_callback("[INFO] Inicialização com o Windows desativada.")
+                    self.log_callback("[INFO] Inicialização ao logar desativada.")
                 except FileNotFoundError:
                     pass
             winreg.CloseKey(key)
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível ajustar registro de inicialização: {e}")
-            self.start_with_windows_var.set(not enabled) # revert checkbox state
+            self.start_with_windows_var.set(not enabled)
 
     # Add/Edit rules dialog
     def add_rule_dialog(self):
@@ -523,15 +711,12 @@ class PrinterScanMoverApp:
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        # Style Dialog Inputs
         lbl_style = {"bg": self.bg_color, "fg": self.text_color, "font": ("Segoe UI", 9, "bold")}
         entry_style = {"bg": "#3d3d3d", "fg": "white", "insertbackground": "white", "relief": "flat", "bd": 1, "font": ("Segoe UI", 10)}
 
-        # Main layout container
         form_frame = tk.Frame(dialog, bg=self.bg_color, padx=20, pady=20)
         form_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Title/Header
         tk.Label(form_frame, text=title, font=("Segoe UI", 12, "bold"), bg=self.bg_color, fg=self.accent_color).pack(anchor=tk.W, pady=(0, 15))
 
         # Rule Name
@@ -609,7 +794,7 @@ class PrinterScanMoverApp:
         )
         chk_enabled.pack(side=tk.RIGHT, padx=10, pady=(15, 0))
 
-        # Horizontal group for Cleanup Days
+        # Cleanup Days
         cleanup_group = tk.Frame(form_frame, bg=self.bg_color)
         cleanup_group.pack(fill=tk.X, pady=10)
         
@@ -620,7 +805,7 @@ class PrinterScanMoverApp:
         entry_cleanup.pack(anchor=tk.W)
         entry_cleanup.insert(0, str(rule_data.get("cleanup_days", 0)) if rule_data else "0")
 
-        # Bottom buttons (Save / Cancel)
+        # Bottom buttons
         actions_frame = tk.Frame(form_frame, bg=self.bg_color)
         actions_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(15, 0))
 
@@ -653,7 +838,6 @@ class PrinterScanMoverApp:
                 return
 
             if rule_data:
-                # Update existing rule
                 rule_data["name"] = name
                 rule_data["source"] = src
                 rule_data["destination"] = dest
@@ -662,7 +846,6 @@ class PrinterScanMoverApp:
                 rule_data["enabled"] = enabled
                 self.log_callback(f"[INFO] Regra '{name}' atualizada.")
             else:
-                # Add new rule
                 new_rule = {
                     "id": str(uuid.uuid4()),
                     "name": name,
@@ -679,6 +862,10 @@ class PrinterScanMoverApp:
             self.populate_table()
             dialog.destroy()
 
+            # In standalone mode, auto-start monitor if enabled and not running
+            if not self.service_mode and enabled and not self.monitor.is_running():
+                self.start_monitoring()
+
         btn_save = tk.Button(
             actions_frame, text="Salvar Regra", bg=self.success_color, fg="black",
             relief="flat", bd=0, activebackground="#27ae60", activeforeground="black",
@@ -689,7 +876,7 @@ class PrinterScanMoverApp:
         btn_cancel = tk.Button(
             actions_frame, text="Cancelar", bg=self.card_color, fg="white",
             relief="flat", bd=0, activebackground=self.border_color, activeforeground="white",
-            font=("Segoe UI", 9, "bold"), command=dialog.destroy, width=12, height=2
+            font=("Segoe UI", 9), command=dialog.destroy, width=10, height=2
         )
         btn_cancel.pack(side=tk.RIGHT)
 
@@ -703,85 +890,89 @@ class PrinterScanMoverApp:
         rule = next((r for r in self.config["rules"] if r["id"] == rule_id), None)
         
         if rule:
-            confirm = messagebox.askyesno("Confirmar Exclusão", f"Tem certeza que deseja excluir a regra '{rule.get('name')}'?")
+            confirm = messagebox.askyesno("Confirmar Exclusão", f"Tem certeza que deseja remover a regra '{rule.get('name')}'?")
             if confirm:
-                self.config["rules"].remove(rule)
+                self.config["rules"] = [r for r in self.config["rules"] if r["id"] != rule_id]
                 self.save_config()
                 self.populate_table()
-                self.log_callback(f"[INFO] Regra '{rule.get('name')}' excluída.")
+                self.log_callback(f"[INFO] Regra '{rule.get('name')}' removida.")
 
-    # System Tray & Exit functions
     def on_close_window(self):
+        """Minimize to tray if available or shutdown gracefully."""
         if TRAY_AVAILABLE:
             self.minimize_to_tray()
         else:
-            confirm = messagebox.askyesno("Sair", "Deseja parar o monitoramento e fechar o aplicativo?")
+            confirm = messagebox.askyesno(
+                "Fechar Aplicativo", 
+                "O monitoramento continuará apenas se o serviço de segundo plano estiver ativo.\nDeseja realmente sair da tela?"
+            )
             if confirm:
                 self.shutdown_app()
 
     def minimize_to_tray(self):
-        self.root.withdraw() # Hide primary window
+        if not TRAY_AVAILABLE:
+            return
+            
+        self.root.withdraw()
         
-        # Setup system tray icon if not created yet
         if not self.tray_icon:
-            # Try to load downloaded printer icon
             image = None
-            if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
+            if os.path.exists(self.icon_path):
                 try:
                     image = Image.open(self.icon_path)
                 except Exception:
                     pass
             
-            # Fallback to drawn icon if loading fails
             if not image:
                 image = Image.new('RGB', (64, 64), color=(30, 30, 30))
                 d = ImageDraw.Draw(image)
-                # Draw a simulated scanner icon inside
                 d.rectangle([16, 24, 48, 40], fill=(26, 115, 232), outline=(255, 255, 255))
                 d.line([16, 32, 48, 32], fill=(255, 255, 255), width=2)
             
             menu = pystray.Menu(
                 pystray.MenuItem("Abrir Painel", self.restore_from_tray, default=True),
-                pystray.MenuItem("Iniciar Monitor", lambda: self.root.after(0, self.start_monitoring)),
-                pystray.MenuItem("Parar Monitor", lambda: self.root.after(0, self.stop_monitoring)),
-                pystray.MenuItem("Sair Completamente", self.shutdown_from_tray)
+                pystray.MenuItem("Sair da Tela", self.shutdown_from_tray)
             )
             
             self.tray_icon = pystray.Icon("PrinterScanMover", image, "Monitor de Escaneamento", menu)
-            
-            # Start tray icon loop in background thread
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
             
-        self.log_callback("[INFO] Aplicativo minimizado para a bandeja do sistema (rodando em segundo plano).")
+        self.log_callback("[INFO] Janela minimizada para a bandeja do sistema.")
 
     def restore_from_tray(self, icon=None, item=None):
         if self.tray_icon:
-            # In pystray, clicking item passes icon context
-            self.root.deiconify() # Restore window
-            self.root.focus_force() # Force focus
+            self.root.deiconify()
+            self.root.focus_force()
 
     def shutdown_from_tray(self, icon, item):
         self.tray_icon.stop()
         self.root.after(0, self.shutdown_app)
 
     def shutdown_app(self):
-        if self.monitor.is_running():
+        if not self.service_mode and self.monitor.is_running():
             self.monitor.stop()
         self.root.destroy()
         sys.exit(0)
 
 
 if __name__ == "__main__":
+    # If launched with "--service" argument (e.g. from Task Scheduler at boot)
+    if "--service" in sys.argv:
+        run_headless_service()
+        sys.exit(0)
+
+    # Single-instance enforcement for GUI: bring existing window to front if already open
+    if focus_existing_gui():
+        sys.exit(0)
+
     root = tk.Tk()
-    
-    # Process "--minimized" startup parameter (used when starting with Windows)
     app = PrinterScanMoverApp(root)
+    
     if "--minimized" in sys.argv:
         if TRAY_AVAILABLE:
             root.withdraw()
             root.after(1000, app.minimize_to_tray)
         else:
-            # Fallback to iconic state if tray libs not present
             root.iconify()
             
     root.mainloop()
