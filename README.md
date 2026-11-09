@@ -11,8 +11,8 @@
 
 [📥 Download Direto (.exe)](#-download-direto-exe) •
 [🎯 O Problema que Resolve](#-o-problema-que-resolve) •
+[🏗️ Arquitetura de Funcionamento](#️-arquitetura-de-funcionamento) •
 [🚀 Funcionalidades (v3.0)](#-funcionalidades-principais) •
-[⚙️ Como Usar](#️-como-usar) •
 [🌐 English Summary](#-english-summary)
 
 </div>
@@ -30,6 +30,34 @@ Em ambientes corporativos, hospitais, escritórios e clínicas com **diversas im
 5. **Falha em servidores sem sessão logada**, quando utilitários comuns dependem de um usuário logado na área de trabalho.
 
 O **Printer Scan Mover** resolve tudo isso em um único executável leve para Windows e Windows Server.
+
+---
+
+## 🏗️ Arquitetura de Funcionamento
+
+```mermaid
+flowchart LR
+    subgraph Impressoras["🖨️ Multifuncionais na Rede (SMB/UNC)"]
+        P1["\\192.168.1.50\scans\n(Recepção - Kyocera)"]
+        P2["\\192.168.1.51\scans\n(RH - Brother)"]
+        P3["\\192.168.1.52\scans\n(Faturamento - Ricoh)"]
+    end
+
+    subgraph Engine["⚙️ PrinterScanMover v3.0 (Serviço Windows 24/7)"]
+        TCP["⚡ Probe Rápido TCP 445/139\n(Timeout 0.6s anti-travamento)"]
+        STB["🛡️ Validação de Escrita\n(Evita PDFs corrompidos)"]
+        CLN["🧹 Expurgo por Expiração\n(Exclui scans > N dias)"]
+    end
+
+    subgraph Servidor["📂 Pastas Centralizadas no Servidor/PC"]
+        D1["D:\Scans\Recepcao"]
+        D2["D:\Scans\RH"]
+        D3["D:\Scans\Faturamento"]
+    end
+
+    P1 & P2 & P3 --> TCP --> STB --> D1 & D2 & D3
+    CLN -. "Limpeza automática diária" .-> D1 & D2 & D3
+```
 
 ---
 
